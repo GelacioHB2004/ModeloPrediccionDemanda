@@ -1,90 +1,139 @@
-# app.py
-#
-# Microservicio Flask (SEPARADO del de recomendación) para servir el modelo
-# de predicción de demanda (Random Forest Regressor).
-# Se despliega en Render como un Web Service nuevo e independiente.
-#
-# Endpoints:
-#   GET /                                -> healthcheck
-#   GET /predecir-demanda/<id_producto>  -> predicción de demanda para los próximos N días
-
-from flask import Flask, jsonify, request
+from flask import Flask, request, jsonify
 from flask_cors import CORS
-import pickle
-import os
-import numpy as np
 import pandas as pd
+import pickle
 
 app = Flask(__name__)
-CORS(app)  # permite que el frontend/backend en otro dominio lo consuma
+CORS(app)  # permite que tu app web (frontend) llame a este backend desde otro dominio
 
-MODELO_PATH = os.path.join(os.path.dirname(__file__), 'modelo_demanda.pkl')
+# ---------------------------------------------------------------------------
+# Carga del modelo (una sola vez, al iniciar el servidor)
+# ---------------------------------------------------------------------------
+with open('modelo_demanda_semanal.pkl', 'rb') as f:
+    modelo_demanda_semanal = pickle.load(f)
 
-with open(MODELO_PATH, 'rb') as f:
-    modelo_demanda = pickle.load(f)
+pipeline = modelo_demanda_semanal['pipeline']
+columnas_entrada = modelo_demanda_semanal['columnas_entrada']
+historico_reciente = modelo_demanda_semanal['historico_reciente']
+metadata = modelo_demanda_semanal['metadata']
 
-print(f"Modelo de demanda cargado. R2: {modelo_demanda['metadata']['r2']}, MAE: {modelo_demanda['metadata']['mae']}")
-
-
-def predecir_demanda(id_producto, dias=7):
-    m = modelo_demanda['modelo']
-    feats = modelo_demanda['features']
-    hist = modelo_demanda['historico_reciente']
-    hist_producto = hist[hist['id_producto'] == id_producto].sort_values('fecha')
-
-    if hist_producto.empty:
-        ultimos_valores = [0] * 7
-        ultima_fecha = pd.Timestamp.today().normalize()
-    else:
-        ultimos_valores = hist_producto['unidades_vendidas'].tolist()
-        ultima_fecha = hist_producto['fecha'].max()
-
-    predicciones = []
-    for i in range(1, dias + 1):
-        fecha_futura = ultima_fecha + pd.Timedelta(days=i)
-        ventas_dia_anterior = ultimos_valores[-1] if ultimos_valores else 0
-        promedio_7 = np.mean(ultimos_valores[-7:]) if ultimos_valores else 0
-
-        fila = pd.DataFrame([{
-            'id_producto': id_producto,
-            'dia_semana': fecha_futura.dayofweek,
-            'es_fin_semana': int(fecha_futura.dayofweek in [5, 6]),
-            'mes': fecha_futura.month,
-            'dia_mes': fecha_futura.day,
-            'ventas_dia_anterior': ventas_dia_anterior,
-            'promedio_ultimos_7_dias': promedio_7
-        }])[feats]
-
-        pred = max(0, round(float(m.predict(fila)[0])))
-        predicciones.append({'fecha': str(fecha_futura.date()), 'unidades_predichas': pred})
-        ultimos_valores.append(pred)
-
-    return predicciones
+semana_max_entrenamiento = metadata['semana_max_entrenamiento']
 
 
+# ---------------------------------------------------------------------------
+# Endpoint de salud (útil para verificar que el servicio de Render está vivo)
+# ---------------------------------------------------------------------------
 @app.route('/', methods=['GET'])
-def healthcheck():
+def home():
     return jsonify({
-        'status': 'ok',
-        'modelo': 'prediccion_demanda',
-        'metadata': modelo_demanda['metadata']
+        'servicio': 'Predicción de demanda semanal - Dulcería Angelitos',
+        'estado': 'activo',
+        'metadata_modelo': metadata
     })
 
 
-@app.route('/predecir-demanda/<int:id_producto>', methods=['GET'])
-def predecir_demanda_endpoint(id_producto):
-    dias = request.args.get('dias', default=7, type=int)
-    predicciones = predecir_demanda(id_producto, dias)
-    total_predicho = sum(p['unidades_predichas'] for p in predicciones)
+# ---------------------------------------------------------------------------
+# Endpoint principal de predicción
+# Body esperado (JSON): { "id_producto": 37 }
+# Opcional: { "id_producto": 37, "semana": 16 }
+# ---------------------------------------------------------------------------
+@app.route('/predecir-demanda', methods=['POST'])
+def predecir_demanda():
+    datos = request.get_json(silent=True)
+
+    if not datos or 'id_producto' not in datos:
+        return jsonify({'error': "Falta el campo 'id_producto' en el body"}), 400
+
+    try:
+        id_producto = int(datos['id_producto'])
+    except (TypeError, ValueError):
+        return jsonify({'error': "'id_producto' debe ser un número entero"}), 400
+
+    # Si no mandan semana, se asume que se quiere predecir la siguiente
+    # semana después de la última semana con la que se entrenó el modelo.
+    semana = int(datos.get('semana', semana_max_entrenamiento + 1))
+
+    # Buscar la última venta conocida de ese producto para calcular
+    # 'ventas_semana' (la venta de la semana anterior).
+    fila_reciente = historico_reciente[historico_reciente['id_producto'] == id_producto]
+
+    if fila_reciente.empty:
+        return jsonify({
+            'error': f'No hay histórico para id_producto={id_producto}. '
+                     f'Verifica que el producto exista y tenga ventas registradas.'
+        }), 404
+
+    ventas_semana = float(fila_reciente['unidades_vendidas'].values[0])
+
+    X_nuevo = pd.DataFrame([{
+        'id_producto': id_producto,
+        'semana': semana,
+        'ventas_semana': ventas_semana
+    }])[columnas_entrada]
+
+    prediccion = pipeline.predict(X_nuevo)[0]
+    prediccion = max(0, round(float(prediccion)))  # no tiene sentido predecir ventas negativas
 
     return jsonify({
         'id_producto': id_producto,
-        'dias_predichos': dias,
-        'total_unidades_predichas': total_predicho,
-        'predicciones_por_dia': predicciones
+        'semana_predicha': semana,
+        'unidades_predichas': prediccion,
+        'ventas_semana_anterior_usada': ventas_semana,
+        'metadata_modelo': {
+            'r2': metadata['r2'],
+            'mae': metadata['mae']
+        }
+    })
+
+
+# ---------------------------------------------------------------------------
+# Endpoint para predecir varios productos de un jalón
+# Body esperado (JSON): { "productos": [37, 43, 12], "semana": 16 }
+# ---------------------------------------------------------------------------
+@app.route('/predecir-demanda-lote', methods=['POST'])
+def predecir_demanda_lote():
+    datos = request.get_json(silent=True)
+
+    if not datos or 'productos' not in datos or not isinstance(datos['productos'], list):
+        return jsonify({'error': "Falta el campo 'productos' (lista de id_producto) en el body"}), 400
+
+    semana = int(datos.get('semana', semana_max_entrenamiento + 1))
+    resultados = []
+
+    for id_producto in datos['productos']:
+        try:
+            id_producto = int(id_producto)
+        except (TypeError, ValueError):
+            resultados.append({'id_producto': id_producto, 'error': 'id_producto inválido'})
+            continue
+
+        fila_reciente = historico_reciente[historico_reciente['id_producto'] == id_producto]
+
+        if fila_reciente.empty:
+            resultados.append({'id_producto': id_producto, 'error': 'sin histórico'})
+            continue
+
+        ventas_semana = float(fila_reciente['unidades_vendidas'].values[0])
+
+        X_nuevo = pd.DataFrame([{
+            'id_producto': id_producto,
+            'semana': semana,
+            'ventas_semana': ventas_semana
+        }])[columnas_entrada]
+
+        prediccion = pipeline.predict(X_nuevo)[0]
+        prediccion = max(0, round(float(prediccion)))
+
+        resultados.append({
+            'id_producto': id_producto,
+            'unidades_predichas': prediccion
+        })
+
+    return jsonify({
+        'semana_predicha': semana,
+        'resultados': resultados
     })
 
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
+    app.run(debug=True)
