@@ -63,13 +63,21 @@ def predecir_demanda():
                      f'Verifica que el producto exista y tenga ventas registradas.'
         }), 404
 
-    ventas_semana = float(fila_reciente['unidades_vendidas'].values[0])
-
-    X_nuevo = pd.DataFrame([{
+    ventas_pasadas = float(fila_reciente['unidades_vendidas'].values[0])
+    
+    datos_modelo = {
         'id_producto': id_producto,
-        'semana': semana,
-        'ventas_semana': ventas_semana
-    }])[columnas_entrada]
+        'semana': semana
+    }
+    
+    for col in columnas_entrada:
+        if col not in datos_modelo:
+            if col in fila_reciente.columns:
+                datos_modelo[col] = float(fila_reciente[col].values[0])
+            else:
+                datos_modelo[col] = ventas_pasadas
+
+    X_nuevo = pd.DataFrame([datos_modelo])[columnas_entrada]
 
     prediccion = pipeline.predict(X_nuevo)[0]
     prediccion = max(0, round(float(prediccion)))  # no tiene sentido predecir ventas negativas
@@ -113,13 +121,21 @@ def predecir_demanda_lote():
             resultados.append({'id_producto': id_producto, 'error': 'sin histórico'})
             continue
 
-        ventas_semana = float(fila_reciente['unidades_vendidas'].values[0])
-
-        X_nuevo = pd.DataFrame([{
+        ventas_pasadas = float(fila_reciente['unidades_vendidas'].values[0])
+        
+        datos_modelo = {
             'id_producto': id_producto,
-            'semana': semana,
-            'ventas_semana': ventas_semana
-        }])[columnas_entrada]
+            'semana': semana
+        }
+        
+        for col in columnas_entrada:
+            if col not in datos_modelo:
+                if col in fila_reciente.columns:
+                    datos_modelo[col] = float(fila_reciente[col].values[0])
+                else:
+                    datos_modelo[col] = ventas_pasadas
+
+        X_nuevo = pd.DataFrame([datos_modelo])[columnas_entrada]
 
         prediccion = pipeline.predict(X_nuevo)[0]
         prediccion = max(0, round(float(prediccion)))
