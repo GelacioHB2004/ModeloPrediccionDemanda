@@ -86,7 +86,7 @@ def predecir_demanda():
         'id_producto': id_producto,
         'semana_predicha': semana,
         'unidades_predichas': prediccion,
-        'ventas_semana_anterior_usada': ventas_semana,
+        'ventas_semana_anterior_usada': ventas_pasadas,
         'metadata_modelo': {
             'r2': metadata['r2'],
             'mae': metadata['mae']
